@@ -21,6 +21,13 @@ Unlike [TabFS](https://omar.website/tabfs/), `cdp-fs` requires **no browser exte
   - `reload`: Touch or write to trigger page reload.
   - `activate`: Touch or write to bring the tab into focus in Chrome.
   - `close`: Touch or write to close the tab.
+- **Zero-Disk Lazy Asset Extraction**:
+  - Each tab includes an `assets/` folder with 4 categorized subdirectories:
+    - `images/`: Images from DOM (`<img>`, `<picture>`, SVG) and network requests (PNG, JPG, GIF, WebP, SVG, AVIF, ICO, data URIs).
+    - `videos/`: Videos from `<video>` tags and media network streams (MP4, WebM, MKV, OGG, etc.).
+    - `audio/`: Audio from `<audio>` elements and sound streams (MP3, WAV, OGG, M4A, FLAC, AAC, etc.).
+    - `other/`: All other page resources (stylesheets, scripts, fonts like WOFF2/TTF, JSON, WASM, PDF, etc.).
+  - **Zero Disk Writes**: Content is fetched lazily and streamed directly from Chrome's memory cache upon `open()`/`read()`, and in-memory buffers are freed immediately on `close()`/`release()`. No temporary files or staging copies are written to disk.
 - **POSIX Directory Operations**:
   - `rm -rf /mountpoint/tab-name` or `rmdir /mountpoint/tab-name`: Closes the browser tab in Chrome!
   - `mkdir /mountpoint/new-tab` or `mkdir /mountpoint/https://example.com`: Creates and opens a new browser tab.
@@ -44,7 +51,12 @@ Unlike [TabFS](https://omar.website/tabfs/), `cdp-fs` requires **no browser exte
   │     ├── id             # Read: the CDP target ID.
   │     ├── reload         # Write/Touch: reload tab.
   │     ├── activate       # Write/Touch: focus tab in Chrome.
-  │     └── close          # Write/Touch: close tab.
+  │     ├── close          # Write/Touch: close tab.
+  │     └── assets/        # Lazy zero-disk asset extraction
+  │           ├── images/  # PNG, JPG, WebP, SVG, GIF, etc.
+  │           ├── videos/  # MP4, WebM, etc.
+  │           ├── audio/   # MP3, WAV, OGG, etc.
+  │           └── other/   # CSS, JS, WOFF2, TTF, JSON, etc.
   └── GitHub/
         ...
 ```
@@ -127,7 +139,19 @@ touch "~/tabs/Example Domain/reload"
 # Open a new tab
 mkdir "~/tabs/https://rust-lang.org"
 
-# Close a tab
+# Browse and extract page assets lazily
+ls -la "~/tabs/Example Domain/assets/images"
+ls -la "~/tabs/Example Domain/assets/videos"
+ls -la "~/tabs/Example Domain/assets/audio"
+ls -la "~/tabs/Example Domain/assets/other"
+
+# Open or view an image directly
+feh "~/tabs/Example Domain/assets/images/logo.png"
+
+# Inspect CSS or JS
+cat "~/tabs/Example Domain/assets/other/style.css"
+
+# Close a tab (recursively cleans up virtual assets, then closes tab in Chrome)
 rm -rf "~/tabs/Example Domain"
 ```
 

@@ -55,6 +55,46 @@ pub struct CdpTarget {
     pub web_socket_debugger_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomMediaItem {
+    pub url: String,
+    #[serde(rename = "type", default)]
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdpResource {
+    pub url: String,
+    #[serde(rename = "type", default)]
+    pub resource_type: String,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: String,
+    #[serde(rename = "contentSize")]
+    pub content_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdpFrame {
+    pub id: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdpFrameTree {
+    pub frame: CdpFrame,
+    #[serde(default)]
+    pub resources: Vec<CdpResource>,
+    #[serde(rename = "childFrames", default)]
+    pub child_frames: Vec<CdpFrameTree>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceTreeResult {
+    #[serde(rename = "frameTree")]
+    pub frame_tree: CdpFrameTree,
+}
+
 #[derive(Clone, Debug)]
 pub struct CdpClient {
     endpoint: String,
@@ -373,5 +413,180 @@ impl CdpClient {
             .map_err(|e| {
                 CdpError::ProtocolError(format!("Failed to decode base64 screenshot: {e}"))
             })
+    }
+
+    /// Retrieve the resource tree of the page (cached and loaded resources)
+    pub fn get_resource_tree(&self, ws_url: &str) -> Result<ResourceTreeResult, CdpError> {
+        let _ = self.send_ws_command(ws_url, "Page.enable", serde_json::json!({}))?;
+        let res = self.send_ws_command(ws_url, "Page.getResourceTree", serde_json::json!({}))?;
+        serde_json::from_value(res)
+            .map_err(|e| CdpError::ProtocolError(format!("Failed to parse resource tree: {e}")))
+    }
+
+    /// Retrieve cached resource content via CDP
+    pub fn get_resource_content(
+        &self,
+        ws_url: &str,
+        frame_id: &str,
+        url: &str,
+    ) -> Result<Vec<u8>, CdpError> {
+        let _ = self.send_ws_command(ws_url, "Page.enable", serde_json::json!({}));
+        let res = self.send_ws_command(
+            ws_url,
+            "Page.getResourceContent",
+            serde_json::json!({
+                "frameId": frame_id,
+                "url": url,
+            }),
+        )?;
+        let content = res
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        let base64_encoded = res
+            .get("base64Encoded")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+
+        if base64_encoded {
+            base64::engine::general_purpose::STANDARD
+                .decode(content)
+                .map_err(|e| {
+                    CdpError::ProtocolError(format!("Failed to decode base64 resource: {e}"))
+                })
+        } else {
+            Ok(content.as_bytes().to_vec())
+        }
+    }
+
+    /// Query DOM media elements (images, videos, audio)
+    pub fn get_dom_media(&self, ws_url: &str) -> Result<Vec<DomMediaItem>, CdpError> {
+        let expr = r#"
+        (() => {
+            const list = [];
+            const seen = new Set();
+            const add = (url, type) => {
+                if (url && typeof url === 'string' && !url.startsWith('about:') && !seen.has(url)) {
+                    seen.add(url);
+                    list.push({url, type});
+                }
+            };
+            document.querySelectorAll('img, picture source, image').forEach(el => {
+                const src = el.currentSrc || el.src || el.getAttribute('src') || el.getAttribute('xlink:href');
+                add(src, 'image');
+            });
+            document.querySelectorAll('video, video source').forEach(el => {
+                const src = el.currentSrc || el.src || el.getAttribute('src');
+                add(src, 'video');
+            });
+            document.querySelectorAll('audio, audio source').forEach(el => {
+                const src = el.currentSrc || el.src || el.getAttribute('src');
+                add(src, 'audio');
+            });
+            return list;
+        })()
+        "#;
+        let res = self.send_ws_command(
+            ws_url,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": expr,
+                "returnByValue": true,
+            }),
+        )?;
+        let val = res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+        serde_json::from_value(val)
+            .map_err(|e| CdpError::ProtocolError(format!("Failed to parse DOM media: {e}")))
+    }
+
+    /// Fetch asset directly inside the tab context (uses browser cache and credentials)
+    pub fn fetch_in_tab(&self, ws_url: &str, url: &str) -> Result<Vec<u8>, CdpError> {
+        if let Some(rest) = url.strip_prefix("data:")
+            && let Some((header, data)) = rest.split_once(',')
+        {
+            if header.contains(";base64") {
+                return base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| {
+                        CdpError::ProtocolError(format!("Failed to decode data URL: {e}"))
+                    });
+            } else {
+                return Ok(data.as_bytes().to_vec());
+            }
+        }
+
+        let json_url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string());
+        let expr = format!(
+            r#"
+            (async () => {{
+                try {{
+                    const res = await fetch({});
+                    const buf = await res.arrayBuffer();
+                    const bytes = new Uint8Array(buf);
+                    let bin = '';
+                    const chunk = 8192;
+                    for (let i = 0; i < bytes.length; i += chunk) {{
+                        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                    }}
+                    return btoa(bin);
+                }} catch (e) {{
+                    return null;
+                }}
+            }})()
+            "#,
+            json_url
+        );
+        let res = self.send_ws_command(
+            ws_url,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": expr,
+                "awaitPromise": true,
+                "returnByValue": true,
+            }),
+        )?;
+        if let Some(b64) = res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+        {
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| CdpError::ProtocolError(format!("Failed to decode fetch base64: {e}")))
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            let mut reader = ureq::get(url)
+                .call()
+                .map_err(|e| CdpError::HttpError(format!("Fetch fallback failed: {e}")))?
+                .into_body()
+                .into_reader();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut bytes)
+                .map_err(|e| CdpError::HttpError(format!("Read fallback failed: {e}")))?;
+            Ok(bytes)
+        } else {
+            Err(CdpError::ProtocolError(format!(
+                "Unable to fetch asset: {url}"
+            )))
+        }
+    }
+
+    /// Retrieve full asset content lazily in memory
+    pub fn get_asset_content(
+        &self,
+        ws_url: &str,
+        frame_id: Option<&str>,
+        url: &str,
+    ) -> Result<Vec<u8>, CdpError> {
+        if let Some(fid) = frame_id
+            && let Ok(bytes) = self.get_resource_content(ws_url, fid, url)
+            && !bytes.is_empty()
+        {
+            return Ok(bytes);
+        }
+        self.fetch_in_tab(ws_url, url)
     }
 }
