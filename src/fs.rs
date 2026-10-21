@@ -226,7 +226,11 @@ pub fn sanitize_title(title: &str) -> String {
         })
         .collect();
     let trimmed = sanitized.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.trim_matches('.').trim().is_empty()
+    {
         "Untitled".to_string()
     } else if trimmed.chars().count() > 180 {
         trimmed.chars().take(180).collect()
@@ -1627,6 +1631,9 @@ mod tests {
         );
         assert_eq!(sanitize_title("   trimmed   "), "trimmed");
         assert_eq!(sanitize_title(""), "Untitled");
+        assert_eq!(sanitize_title("."), "Untitled");
+        assert_eq!(sanitize_title(".."), "Untitled");
+        assert_eq!(sanitize_title("..."), "Untitled");
         assert_eq!(sanitize_title("   ///   "), "---");
     }
 
