@@ -203,6 +203,9 @@ pub struct CdpFs {
     target_names: RwLock<HashMap<String, String>>, // target_id -> sanitized_name
     name_to_target: RwLock<HashMap<String, String>>, // sanitized_name -> target_id
 
+    // Cached target information for size computations
+    cached_targets: RwLock<HashMap<String, CdpTarget>>,
+
     // Evaluation results cache: target_id -> last eval output
     eval_results: RwLock<HashMap<String, String>>,
 
@@ -262,6 +265,7 @@ impl CdpFs {
             key_to_ino: RwLock::new(key_to_ino),
             target_names: RwLock::new(HashMap::new()),
             name_to_target: RwLock::new(HashMap::new()),
+            cached_targets: RwLock::new(HashMap::new()),
             eval_results: RwLock::new(HashMap::new()),
             tab_assets: RwLock::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
@@ -360,6 +364,8 @@ impl CdpFs {
         }
 
         {
+            let mut ct = self.cached_targets.write().unwrap();
+            *ct = tabs.iter().map(|t| (t.id.clone(), t.clone())).collect();
             let mut tn = self.target_names.write().unwrap();
             *tn = new_target_names;
             let mut nt = self.name_to_target.write().unwrap();
@@ -367,6 +373,32 @@ impl CdpFs {
         }
 
         tabs
+    }
+
+    fn compute_tab_file_size(&self, target_id: &str, kind: TabFileKind) -> u64 {
+        match kind {
+            TabFileKind::Id => (target_id.len() + 1) as u64,
+            TabFileKind::Reload | TabFileKind::Activate | TabFileKind::Close => 0,
+            TabFileKind::Url => {
+                let targets = self.cached_targets.read().unwrap();
+                targets
+                    .get(target_id)
+                    .map(|t| (t.url.len() + 1) as u64)
+                    .unwrap_or(0)
+            }
+            TabFileKind::Title => {
+                let targets = self.cached_targets.read().unwrap();
+                targets
+                    .get(target_id)
+                    .map(|t| (t.title.len() + 1) as u64)
+                    .unwrap_or(0)
+            }
+            TabFileKind::Eval => {
+                let evals = self.eval_results.read().unwrap();
+                evals.get(target_id).map(|e| e.len() as u64).unwrap_or(0)
+            }
+            TabFileKind::Text | TabFileKind::Html | TabFileKind::Screenshot => 0,
+        }
     }
 
     pub fn get_or_discover_assets(&self, target_id: &str) -> Vec<TabAsset> {
@@ -774,11 +806,7 @@ impl Filesystem for CdpFs {
                         }
                     };
 
-                    let default_size = match kind {
-                        TabFileKind::Id => (target_id.len() + 1) as u64,
-                        TabFileKind::Reload | TabFileKind::Activate | TabFileKind::Close => 0,
-                        _ => 1024 * 1024, // 1MB virtual capacity so kernel VFS allows read
-                    };
+                    let default_size = self.compute_tab_file_size(&target_id, kind);
 
                     let ino = self.get_or_create_ino(InodeKey::TabFile(target_id, kind));
                     let attr =
@@ -811,7 +839,7 @@ impl Filesystem for CdpFs {
                             category,
                             name_str.to_string(),
                         ));
-                        let size = asset.size.unwrap_or(256 * 1024 * 1024);
+                        let size = asset.size.unwrap_or(0);
                         let attr = self.make_attr(ino, FileType::RegularFile, size, 0o444);
                         reply.entry(&TTL, &attr, Generation(0));
                     } else {
@@ -861,11 +889,7 @@ impl Filesystem for CdpFs {
                         .map(|f| f.read_buf.len() as u64)
                         .unwrap_or(0)
                 } else {
-                    match kind {
-                        TabFileKind::Id => (target_id.len() + 1) as u64,
-                        TabFileKind::Reload | TabFileKind::Activate | TabFileKind::Close => 0,
-                        _ => 1024 * 1024,
-                    }
+                    self.compute_tab_file_size(target_id, kind)
                 };
 
                 let attr = self.make_attr(ino, FileType::RegularFile, size, kind.mode());
@@ -892,7 +916,7 @@ impl Filesystem for CdpFs {
                                 .and_then(|a| a.size)
                         })
                     };
-                    cached_size.unwrap_or(256 * 1024 * 1024)
+                    cached_size.unwrap_or(0)
                 };
 
                 let attr = self.make_attr(ino, FileType::RegularFile, size, 0o444);
