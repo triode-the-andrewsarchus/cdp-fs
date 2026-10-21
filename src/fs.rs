@@ -1567,7 +1567,27 @@ impl Filesystem for CdpFs {
             Ok(new_tab) => {
                 let ino = self.get_or_create_ino(InodeKey::TabDir(new_tab.id.clone()));
                 let attr = self.make_attr(ino, FileType::Directory, 0, 0o755);
+
+                // If user provided a custom non-URL title, set it on the new tab in Chrome
+                if !name_str.starts_with("http://")
+                    && !name_str.starts_with("https://")
+                    && name_str != "about:blank"
+                {
+                    if let Ok(ws_url) = self.client.resolve_ws_url(&new_tab.id) {
+                        let _ = self.client.set_title(&ws_url, name_str);
+                    }
+                }
+
                 self.refresh_tabs();
+
+                // Explicitly ensure the mkdir name is mapped to the new tab so subsequent lookups succeed immediately
+                {
+                    let mut tn = self.target_names.write().unwrap();
+                    let mut nt = self.name_to_target.write().unwrap();
+                    tn.insert(new_tab.id.clone(), name_str.to_string());
+                    nt.insert(name_str.to_string(), new_tab.id.clone());
+                }
+
                 reply.entry(&TTL, &attr, Generation(0));
             }
             Err(e) => {
