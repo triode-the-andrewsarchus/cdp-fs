@@ -2,16 +2,29 @@
 name = "cdp-fs"
 version = "0.1.0"
 edition = "2024"
+authors = ["Vega Carlson <vegac@protonmail.com>"]
+description = "A FUSE filesystem in Rust that mounts Chrome/Chromium browser tabs as an interactive POSIX directory via Chrome DevTools Protocol"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["fuse", "chrome", "cdp", "devtools", "filesystem"]
+categories = ["filesystem", "command-line-utilities", "development-tools::debugging"]
 
 [dependencies]
-base64 = "0.23.1"
-clap = { version = "4.6.7", features = ["derive"] }
-env_logger = "0.11.11"
+# FUSE bindings
 fuser = "0.18.0"
 libc = "0.2.191"
+
+# CLI & Logging
+clap = { version = "4.6.7", features = ["derive"] }
+env_logger = "0.11.11"
 log = "0.4.34"
+
+# HTTP & WebSockets (Chrome DevTools Protocol)
+ureq = "3.5.0"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+
+# Serialization & Utilities
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
-ureq = "3.5.0"
+base64 = "0.23.1"
