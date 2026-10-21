@@ -647,19 +647,21 @@ fn extension_from_mime(mime: &str) -> Option<&'static str> {
 }
 
 fn urlencoding_decode(s: &str) -> String {
-    let mut result = String::new();
+    let mut bytes = Vec::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '%'
             && let (Some(h1), Some(h2)) = (chars.next(), chars.next())
             && let Ok(byte) = u8::from_str_radix(&format!("{}{}", h1, h2), 16)
         {
-            result.push(byte as char);
-            continue;
+            bytes.push(byte);
+        } else {
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            bytes.extend_from_slice(encoded.as_bytes());
         }
-        result.push(c);
     }
-    result
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -1696,6 +1698,8 @@ mod tests {
         assert_eq!(urlencoding_decode("hello%20world"), "hello world");
         assert_eq!(urlencoding_decode("%2Fpath%2Ffile"), "/path/file");
         assert_eq!(urlencoding_decode("plain_text"), "plain_text");
+        assert_eq!(urlencoding_decode("%E2%9C%93_check"), "✓_check");
+        assert_eq!(urlencoding_decode("%F0%9F%A6%80_crab"), "🦀_crab");
     }
 
     #[test]
