@@ -3,7 +3,7 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -106,6 +106,7 @@ pub struct ResourceTreeResult {
 #[derive(Clone)]
 pub struct CdpClient {
     endpoint: String,
+    http_client: ureq::Agent,
     ws_cache: Arc<RwLock<HashMap<String, String>>>,
     ws_pool: Arc<Mutex<HashMap<String, WsStream>>>,
     next_req_id: Arc<AtomicI64>,
@@ -122,8 +123,15 @@ impl std::fmt::Debug for CdpClient {
 impl CdpClient {
     pub fn new(endpoint: String) -> Self {
         let endpoint = endpoint.trim_end_matches('/').to_string();
+        let http_config = ureq::config::Config::builder()
+            .timeout_connect(Some(Duration::from_secs(3)))
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build();
+        let http_client: ureq::Agent = http_config.into();
+
         Self {
             endpoint,
+            http_client,
             ws_cache: Arc::new(RwLock::new(HashMap::new())),
             ws_pool: Arc::new(Mutex::new(HashMap::new())),
             next_req_id: Arc::new(AtomicI64::new(1)),
@@ -138,13 +146,13 @@ impl CdpClient {
     /// Check if Chrome is reachable
     pub fn is_running(&self) -> bool {
         let url = format!("{}/json/version", self.endpoint);
-        ureq::get(&url).call().is_ok()
+        self.http_client.get(&url).call().is_ok()
     }
 
     /// Query the /json/list endpoint to retrieve all targets
     pub fn list_targets(&self) -> Result<Vec<CdpTarget>, CdpError> {
         let url = format!("{}/json/list", self.endpoint);
-        let mut resp = match ureq::get(&url).call() {
+        let mut resp = match self.http_client.get(&url).call() {
             Ok(resp) => resp,
             Err(e) => {
                 return Err(CdpError::ChromeNotRunning(
@@ -197,7 +205,7 @@ impl CdpClient {
         }
 
         let url = format!("{}/json/close/{}", self.endpoint, target_id);
-        match ureq::get(&url).call() {
+        match self.http_client.get(&url).call() {
             Ok(_) => {
                 debug!("Closed target {}", target_id);
                 Ok(())
@@ -213,7 +221,8 @@ impl CdpClient {
     /// Activate / focus a tab
     pub fn activate_target(&self, target_id: &str) -> Result<(), CdpError> {
         let url = format!("{}/json/activate/{}", self.endpoint, target_id);
-        ureq::get(&url)
+        self.http_client
+            .get(&url)
             .call()
             .map_err(|e| CdpError::HttpError(format!("Failed to activate tab: {e}")))?;
         Ok(())
@@ -227,7 +236,9 @@ impl CdpClient {
             format!("{}/json/new?{}", self.endpoint, url)
         };
 
-        let mut resp = ureq::put(&request_url)
+        let mut resp = self
+            .http_client
+            .put(&request_url)
             .send_empty()
             .map_err(|e| CdpError::HttpError(format!("Failed to create new tab: {e}")))?;
 
@@ -269,14 +280,42 @@ impl CdpClient {
     }
 
     fn connect_ws(ws_url: &str) -> Result<WsStream, CdpError> {
-        let (mut socket, _) = tungstenite::connect(ws_url).map_err(|e| {
-            CdpError::WebSocketError(format!("WebSocket connect failed to {}: {}", ws_url, e))
+        let request =
+            tungstenite::client::IntoClientRequest::into_client_request(ws_url).map_err(|e| {
+                CdpError::WebSocketError(format!("Invalid WebSocket URL {ws_url}: {e}"))
+            })?;
+        let uri = request.uri();
+        let host = uri
+            .host()
+            .ok_or_else(|| CdpError::WebSocketError("Missing host in WebSocket URL".to_string()))?;
+        let port = uri.port_u16().unwrap_or(80);
+
+        let addrs: Vec<std::net::SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| {
+                CdpError::WebSocketError(format!("DNS resolution failed for {host}:{port}: {e}"))
+            })?
+            .collect();
+
+        let mut stream = None;
+        for addr in addrs {
+            if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+                stream = Some(s);
+                break;
+            }
+        }
+        let tcp_stream = stream.ok_or_else(|| {
+            CdpError::WebSocketError(format!("Failed to connect to {ws_url} within timeout"))
         })?;
 
-        if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        }
+        let _ = tcp_stream.set_nodelay(true);
+        let _ = tcp_stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = tcp_stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+        let (socket, _) =
+            tungstenite::client(request, MaybeTlsStream::Plain(tcp_stream)).map_err(|e| {
+                CdpError::WebSocketError(format!("WebSocket handshake failed to {ws_url}: {e}"))
+            })?;
 
         Ok(socket)
     }
@@ -635,7 +674,9 @@ impl CdpClient {
                 .decode(b64)
                 .map_err(|e| CdpError::ProtocolError(format!("Failed to decode fetch base64: {e}")))
         } else if url.starts_with("http://") || url.starts_with("https://") {
-            let mut reader = ureq::get(url)
+            let mut reader = self
+                .http_client
+                .get(url)
                 .call()
                 .map_err(|e| CdpError::HttpError(format!("Fetch fallback failed: {e}")))?
                 .into_body()
