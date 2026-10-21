@@ -642,8 +642,9 @@ impl CdpClient {
             .map_err(|e| CdpError::ProtocolError(format!("Failed to parse DOM media: {e}")))
     }
 
-    /// Fetch asset directly inside the tab context (uses browser cache and credentials)
+    /// Fetch asset directly inside the tab context or via direct HTTP streaming
     pub fn fetch_in_tab(&self, ws_url: &str, url: &str) -> Result<Vec<u8>, CdpError> {
+        // 1. Data URLs can be decoded directly in Rust without browser or network overhead
         if let Some(rest) = url.strip_prefix("data:")
             && let Some((header, data)) = rest.split_once(',')
         {
@@ -658,6 +659,19 @@ impl CdpClient {
             }
         }
 
+        // 2. For HTTP/HTTPS URLs, stream directly via HTTP client first to avoid heavy V8 base64 marshaling
+        if url.starts_with("http://") || url.starts_with("https://") {
+            if let Ok(mut resp) = self.http_client.get(url).call() {
+                let mut bytes = Vec::new();
+                if resp.body_mut().as_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty()
+                {
+                    return Ok(bytes);
+                }
+            }
+        }
+
+        // 3. For blob: URLs or session-authenticated assets where direct HTTP failed,
+        // evaluate fetch() inside the tab context
         let json_url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string());
         let expr = format!(
             r#"
@@ -696,18 +710,6 @@ impl CdpClient {
             base64::engine::general_purpose::STANDARD
                 .decode(b64)
                 .map_err(|e| CdpError::ProtocolError(format!("Failed to decode fetch base64: {e}")))
-        } else if url.starts_with("http://") || url.starts_with("https://") {
-            let mut reader = self
-                .http_client
-                .get(url)
-                .call()
-                .map_err(|e| CdpError::HttpError(format!("Fetch fallback failed: {e}")))?
-                .into_body()
-                .into_reader();
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut reader, &mut bytes)
-                .map_err(|e| CdpError::HttpError(format!("Read fallback failed: {e}")))?;
-            Ok(bytes)
         } else {
             Err(CdpError::ProtocolError(format!(
                 "Unable to fetch asset: {url}"
