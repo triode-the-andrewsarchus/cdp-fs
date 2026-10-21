@@ -523,8 +523,25 @@ impl CdpFs {
 }
 
 pub fn categorize_asset(type_str: &str, mime: &str, url: &str) -> AssetCategory {
+    let embedded_mime = if let Some(rest) = url.strip_prefix("data:") {
+        rest.split(',')
+            .next()
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+    } else {
+        ""
+    };
+    let effective_mime = if !embedded_mime.is_empty() {
+        embedded_mime
+    } else {
+        mime
+    };
+
     let lower_type = type_str.to_lowercase();
-    let lower_mime = mime.to_lowercase();
+    let lower_mime = effective_mime.to_lowercase();
     let lower_url = url.split('?').next().unwrap_or(url).to_lowercase();
 
     if lower_type == "image"
@@ -582,8 +599,15 @@ pub fn derive_asset_filename(
     fallback_index: usize,
     category: AssetCategory,
 ) -> String {
-    if url.starts_with("data:") {
-        let ext = extension_from_mime(mime).unwrap_or(match category {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let header = rest.split(',').next().unwrap_or("");
+        let embedded_mime = header.split(';').next().unwrap_or("").trim();
+        let effective_mime = if !embedded_mime.is_empty() {
+            embedded_mime
+        } else {
+            mime
+        };
+        let ext = extension_from_mime(effective_mime).unwrap_or(match category {
             AssetCategory::Images => "png",
             AssetCategory::Videos => "mp4",
             AssetCategory::Audio => "mp3",
@@ -1713,6 +1737,15 @@ mod tests {
                 AssetCategory::Videos
             ),
             "clip.mp4"
+        );
+        assert_eq!(
+            derive_asset_filename(
+                "data:image/svg+xml;base64,PHN2Zy...",
+                "",
+                4,
+                AssetCategory::Images
+            ),
+            "data_images_4.svg"
         );
         assert_eq!(
             derive_asset_filename(
