@@ -185,6 +185,7 @@ struct OpenFile {
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
     is_write: bool,
+    executed: bool,
 }
 
 pub struct CdpFs {
@@ -1160,6 +1161,7 @@ impl Filesystem for CdpFs {
                     read_buf,
                     write_buf: Vec::new(),
                     is_write,
+                    executed: false,
                 };
 
                 {
@@ -1241,6 +1243,7 @@ impl Filesystem for CdpFs {
                     read_buf,
                     write_buf: Vec::new(),
                     is_write: false,
+                    executed: false,
                 };
 
                 {
@@ -1328,22 +1331,26 @@ impl Filesystem for CdpFs {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        let (target_id, kind, write_buf, is_write) = {
-            let files = self.open_files.read().unwrap();
-            match files.get(&fh) {
-                Some(f) => (f.target_id.clone(), f.kind, f.write_buf.clone(), f.is_write),
+        let (target_id, kind, write_buf, should_execute) = {
+            let mut files = self.open_files.write().unwrap();
+            match files.get_mut(&fh) {
+                Some(f) => {
+                    let is_control = matches!(
+                        f.kind,
+                        Some(TabFileKind::Reload | TabFileKind::Activate | TabFileKind::Close)
+                    );
+                    let should_execute =
+                        f.is_write && (!f.write_buf.is_empty() || is_control) && !f.executed;
+                    f.executed = true;
+                    let buf = std::mem::take(&mut f.write_buf);
+                    (f.target_id.clone(), f.kind, buf, should_execute)
+                }
                 None => {
                     reply.ok();
                     return;
                 }
             }
         };
-
-        let is_control = matches!(
-            kind,
-            Some(TabFileKind::Reload | TabFileKind::Activate | TabFileKind::Close)
-        );
-        let should_execute = is_write && (!write_buf.is_empty() || is_control);
 
         if should_execute && let Some(k) = kind {
             let text = String::from_utf8_lossy(&write_buf);
