@@ -333,6 +333,25 @@ impl CdpFs {
             }
         };
 
+        let active_ids: Vec<String> = tabs.iter().map(|t| t.id.clone()).collect();
+        let active_set: std::collections::HashSet<&str> =
+            active_ids.iter().map(|s| s.as_str()).collect();
+
+        // Prune any tabs that are no longer active
+        let old_ids: Vec<String> = {
+            let tn = self.target_names.read().unwrap();
+            tn.keys()
+                .filter(|id| !active_set.contains(id.as_str()))
+                .cloned()
+                .collect()
+        };
+
+        for old_id in old_ids {
+            self.prune_tab(&old_id);
+        }
+
+        self.client.prune_targets(&active_ids);
+
         let mut name_counts: HashMap<String, usize> = HashMap::new();
         let mut new_target_names = HashMap::new();
         let mut new_name_to_target = HashMap::new();
@@ -373,6 +392,57 @@ impl CdpFs {
         }
 
         tabs
+    }
+
+    /// Prune all cached resources and allocated inodes for a tab
+    fn prune_tab(&self, target_id: &str) {
+        {
+            let mut evals = self.eval_results.write().unwrap();
+            evals.remove(target_id);
+        }
+        {
+            let mut assets = self.tab_assets.write().unwrap();
+            assets.remove(target_id);
+        }
+        {
+            let mut targets = self.cached_targets.write().unwrap();
+            targets.remove(target_id);
+        }
+        {
+            let mut tn = self.target_names.write().unwrap();
+            if let Some(name) = tn.remove(target_id) {
+                let mut nt = self.name_to_target.write().unwrap();
+                nt.remove(&name);
+            }
+        }
+
+        let mut inos_to_remove = Vec::new();
+        {
+            let mut key_map = self.key_to_ino.write().unwrap();
+            key_map.retain(|key, &mut ino| {
+                let belongs = match key {
+                    InodeKey::Root => false,
+                    InodeKey::TabDir(id)
+                    | InodeKey::TabFile(id, _)
+                    | InodeKey::AssetsDir(id)
+                    | InodeKey::AssetCategoryDir(id, _)
+                    | InodeKey::AssetFile(id, _, _) => id == target_id,
+                };
+                if belongs {
+                    inos_to_remove.push(ino);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        {
+            let mut ino_map = self.ino_to_entry.write().unwrap();
+            for ino in inos_to_remove {
+                ino_map.remove(&ino);
+            }
+        }
     }
 
     fn compute_tab_file_size(&self, target_id: &str, kind: TabFileKind) -> u64 {
@@ -987,6 +1057,7 @@ impl Filesystem for CdpFs {
                         }
                         TabFileKind::Close => {
                             let _ = self.client.close_target(target_id);
+                            self.prune_tab(target_id);
                         }
                         _ => {}
                     }
@@ -1467,6 +1538,7 @@ impl Filesystem for CdpFs {
                 }
                 TabFileKind::Close => {
                     let _ = self.client.close_target(&target_id);
+                    self.prune_tab(&target_id);
                 }
                 _ => {}
             }
@@ -1527,13 +1599,7 @@ impl Filesystem for CdpFs {
                 warn!("Failed to close tab {}: {}", target_id, e);
             }
 
-            // Clean up mappings
-            {
-                let mut tn = self.target_names.write().unwrap();
-                tn.remove(&target_id);
-                let mut nt = self.name_to_target.write().unwrap();
-                nt.remove(name_str);
-            }
+            self.prune_tab(&target_id);
 
             reply.ok();
         } else {
@@ -1796,5 +1862,38 @@ mod tests {
         assert_eq!(sanitize_filename("valid_name.png"), "valid_name.png");
         assert_eq!(sanitize_filename("bad/name:here\0"), "bad_name:here_");
         assert_eq!(sanitize_filename("...dots..."), "dots");
+    }
+
+    #[test]
+    fn test_prune_tab() {
+        let client = CdpClient::new("http://localhost:9222".to_string());
+        let fs = CdpFs::new(client);
+        let tab_id = "test_tab_123";
+
+        let _tab_ino = fs.get_or_create_ino(InodeKey::TabDir(tab_id.to_string()));
+        let file_ino =
+            fs.get_or_create_ino(InodeKey::TabFile(tab_id.to_string(), TabFileKind::Title));
+        fs.target_names
+            .write()
+            .unwrap()
+            .insert(tab_id.to_string(), "My Tab".to_string());
+        fs.name_to_target
+            .write()
+            .unwrap()
+            .insert("My Tab".to_string(), tab_id.to_string());
+        fs.eval_results
+            .write()
+            .unwrap()
+            .insert(tab_id.to_string(), "result".to_string());
+
+        assert!(fs.get_entry(file_ino).is_some());
+        assert!(fs.target_names.read().unwrap().contains_key(tab_id));
+
+        fs.prune_tab(tab_id);
+
+        assert!(fs.get_entry(file_ino).is_none());
+        assert!(!fs.target_names.read().unwrap().contains_key(tab_id));
+        assert!(!fs.name_to_target.read().unwrap().contains_key("My Tab"));
+        assert!(!fs.eval_results.read().unwrap().contains_key(tab_id));
     }
 }

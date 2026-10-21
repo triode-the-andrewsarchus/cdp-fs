@@ -218,6 +218,29 @@ impl CdpClient {
         }
     }
 
+    /// Prune cached WebSocket URLs and connection pool for targets that are no longer active
+    pub fn prune_targets(&self, active_target_ids: &[String]) {
+        let active_set: std::collections::HashSet<&str> =
+            active_target_ids.iter().map(|s| s.as_str()).collect();
+        let mut urls_to_remove = Vec::new();
+
+        if let Ok(mut cache) = self.ws_cache.write() {
+            cache.retain(|id, ws_url| {
+                let keep = active_set.contains(id.as_str());
+                if !keep {
+                    urls_to_remove.push(ws_url.clone());
+                }
+                keep
+            });
+        }
+
+        if let Ok(mut pool) = self.ws_pool.lock() {
+            for ws_url in urls_to_remove {
+                pool.remove(&ws_url);
+            }
+        }
+    }
+
     /// Activate / focus a tab
     pub fn activate_target(&self, target_id: &str) -> Result<(), CdpError> {
         let url = format!("{}/json/activate/{}", self.endpoint, target_id);
