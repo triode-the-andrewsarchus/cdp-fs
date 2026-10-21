@@ -904,11 +904,36 @@ impl Filesystem for CdpFs {
                 let attr = self.make_attr(ino, FileType::Directory, 0, 0o755);
                 reply.attr(&TTL, &attr);
             }
-            InodeEntry::TabFile { kind, .. } => {
+            InodeEntry::TabFile {
+                ref target_id,
+                kind,
+            } => {
                 if let (Some(handle), Some(sz)) = (fh, size) {
                     let mut files = self.open_files.write().unwrap();
                     if let Some(file) = files.get_mut(&handle) {
                         file.write_buf.truncate(sz as usize);
+                    }
+                }
+                // Handle touch on control files when utimensat/setattr updates timestamps
+                if (_atime.is_some() || _mtime.is_some())
+                    && matches!(
+                        kind,
+                        TabFileKind::Reload | TabFileKind::Activate | TabFileKind::Close
+                    )
+                {
+                    match kind {
+                        TabFileKind::Reload => {
+                            if let Ok(ws_url) = self.client.resolve_ws_url(target_id) {
+                                let _ = self.client.reload(&ws_url);
+                            }
+                        }
+                        TabFileKind::Activate => {
+                            let _ = self.client.activate_target(target_id);
+                        }
+                        TabFileKind::Close => {
+                            let _ = self.client.close_target(target_id);
+                        }
+                        _ => {}
                     }
                 }
                 let attr =
@@ -1314,7 +1339,13 @@ impl Filesystem for CdpFs {
             }
         };
 
-        if let (true, Some(k)) = (is_write && !write_buf.is_empty(), kind) {
+        let is_control = matches!(
+            kind,
+            Some(TabFileKind::Reload | TabFileKind::Activate | TabFileKind::Close)
+        );
+        let should_execute = is_write && (!write_buf.is_empty() || is_control);
+
+        if should_execute && let Some(k) = kind {
             let text = String::from_utf8_lossy(&write_buf);
             let trimmed = text.trim();
 
