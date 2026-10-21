@@ -1,8 +1,16 @@
 use base64::Engine;
 use log::debug;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Read;
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tungstenite::protocol::WebSocket;
+use tungstenite::stream::MaybeTlsStream;
+
+type WsStream = WebSocket<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CdpError {
@@ -95,15 +103,31 @@ pub struct ResourceTreeResult {
     pub frame_tree: CdpFrameTree,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CdpClient {
     endpoint: String,
+    ws_cache: Arc<RwLock<HashMap<String, String>>>,
+    ws_pool: Arc<Mutex<HashMap<String, WsStream>>>,
+    next_req_id: Arc<AtomicI64>,
+}
+
+impl std::fmt::Debug for CdpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CdpClient")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 impl CdpClient {
     pub fn new(endpoint: String) -> Self {
         let endpoint = endpoint.trim_end_matches('/').to_string();
-        Self { endpoint }
+        Self {
+            endpoint,
+            ws_cache: Arc::new(RwLock::new(HashMap::new())),
+            ws_pool: Arc::new(Mutex::new(HashMap::new())),
+            next_req_id: Arc::new(AtomicI64::new(1)),
+        }
     }
 
     #[allow(dead_code)]
@@ -139,6 +163,14 @@ impl CdpClient {
         let targets: Vec<CdpTarget> = serde_json::from_str(&body)
             .map_err(|e| CdpError::HttpError(format!("Failed to parse JSON target list: {e}")))?;
 
+        if let Ok(mut cache) = self.ws_cache.write() {
+            for target in &targets {
+                if let Some(ws_url) = &target.web_socket_debugger_url {
+                    cache.insert(target.id.clone(), ws_url.clone());
+                }
+            }
+        }
+
         Ok(targets)
     }
 
@@ -153,6 +185,17 @@ impl CdpClient {
 
     /// Close a target by ID
     pub fn close_target(&self, target_id: &str) -> Result<(), CdpError> {
+        let ws_url = if let Ok(mut cache) = self.ws_cache.write() {
+            cache.remove(target_id)
+        } else {
+            None
+        };
+        if let Some(ws_url) = ws_url {
+            if let Ok(mut pool) = self.ws_pool.lock() {
+                pool.remove(&ws_url);
+            }
+        }
+
         let url = format!("{}/json/close/{}", self.endpoint, target_id);
         match ureq::get(&url).call() {
             Ok(_) => {
@@ -197,11 +240,23 @@ impl CdpClient {
         let target: CdpTarget = serde_json::from_str(&body)
             .map_err(|e| CdpError::HttpError(format!("Failed to parse target JSON: {e}")))?;
 
+        if let Some(ref ws_url) = target.web_socket_debugger_url {
+            if let Ok(mut cache) = self.ws_cache.write() {
+                cache.insert(target.id.clone(), ws_url.clone());
+            }
+        }
+
         Ok(target)
     }
 
     /// Resolve WebSocket URL for a target ID
     pub fn resolve_ws_url(&self, target_id: &str) -> Result<String, CdpError> {
+        if let Ok(cache) = self.ws_cache.read() {
+            if let Some(ws_url) = cache.get(target_id) {
+                return Ok(ws_url.clone());
+            }
+        }
+
         let tabs = self.list_targets()?;
         for tab in tabs {
             if tab.id == target_id {
@@ -213,6 +268,28 @@ impl CdpClient {
         Err(CdpError::TargetNotFound(target_id.to_string()))
     }
 
+    fn connect_ws(ws_url: &str) -> Result<WsStream, CdpError> {
+        let (mut socket, _) = tungstenite::connect(ws_url).map_err(|e| {
+            CdpError::WebSocketError(format!("WebSocket connect failed to {}: {}", ws_url, e))
+        })?;
+
+        if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        }
+
+        Ok(socket)
+    }
+
+    fn get_or_connect_ws(&self, ws_url: &str) -> Result<WsStream, CdpError> {
+        if let Ok(mut pool) = self.ws_pool.lock() {
+            if let Some(stream) = pool.remove(ws_url) {
+                return Ok(stream);
+            }
+        }
+        Self::connect_ws(ws_url)
+    }
+
     /// Send a command to a target over WebSocket and wait for the response
     pub fn send_ws_command(
         &self,
@@ -220,28 +297,24 @@ impl CdpClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, CdpError> {
-        let (mut socket, _) = tungstenite::connect(ws_url).map_err(|e| {
-            CdpError::WebSocketError(format!("WebSocket connect failed to {}: {}", ws_url, e))
-        })?;
-
-        // Configure read/write timeouts on the underlying plain TCP stream
-        if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        }
-
-        let request_id = 1;
+        let mut socket = self.get_or_connect_ws(ws_url)?;
+        let request_id = self.next_req_id.fetch_add(1, Ordering::SeqCst);
         let msg = serde_json::json!({
             "id": request_id,
             "method": method,
             "params": params,
         });
+        let text_msg = msg.to_string();
 
-        socket
-            .send(tungstenite::Message::Text(msg.to_string().into()))
-            .map_err(|e| {
-                CdpError::WebSocketError(format!("Failed to send WebSocket message: {e}"))
-            })?;
+        if let Err(e) = socket.send(tungstenite::Message::Text(text_msg.clone().into())) {
+            debug!("Pooled WebSocket send error ({}), reconnecting...", e);
+            socket = Self::connect_ws(ws_url)?;
+            socket
+                .send(tungstenite::Message::Text(text_msg.into()))
+                .map_err(|e| {
+                    CdpError::WebSocketError(format!("Failed to send WebSocket message: {e}"))
+                })?;
+        }
 
         loop {
             let reply = socket.read().map_err(|e| {
@@ -254,6 +327,10 @@ impl CdpClient {
                 })?;
 
                 if parsed.get("id").and_then(|id| id.as_i64()) == Some(request_id) {
+                    if let Ok(mut pool) = self.ws_pool.lock() {
+                        pool.insert(ws_url.to_string(), socket);
+                    }
+
                     if let Some(err) = parsed.get("error") {
                         let err_msg = err
                             .get("message")
