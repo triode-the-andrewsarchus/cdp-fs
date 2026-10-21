@@ -1309,7 +1309,7 @@ impl Filesystem for CdpFs {
         _req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
-        _offset: u64,
+        offset: u64,
         data: &[u8],
         _write_flags: WriteFlags,
         _flags: OpenFlags,
@@ -1325,7 +1325,12 @@ impl Filesystem for CdpFs {
             }
         };
 
-        file.write_buf.extend_from_slice(data);
+        let start = offset as usize;
+        let end = start + data.len();
+        if file.write_buf.len() < end {
+            file.write_buf.resize(end, 0);
+        }
+        file.write_buf[start..end].copy_from_slice(data);
         reply.written(data.len() as u32);
     }
 
